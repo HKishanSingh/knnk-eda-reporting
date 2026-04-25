@@ -79,12 +79,10 @@ SCOPE = [
 
 @st.cache_resource
 def get_gsheet_client():
-    try:
-        creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"], scopes=SCOPE
-        )
-    except Exception:
-        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPE)
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=SCOPE
+    )
     return gspread.authorize(creds)
 
 @st.cache_resource

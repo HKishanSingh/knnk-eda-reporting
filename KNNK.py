@@ -241,8 +241,10 @@ def process_data(df, platform, campaign, date_range=None):
         col_name = "Line item"
     elif "Package/Roadblock" in n_df.columns:
         col_name = "Package/Roadblock"
+    elif "Placement" in n_df.columns:
+        col_name = "Placement"
     else:
-        st.warning(f"⚠️ {platform}: Required column ('Line item' / 'Package/Roadblock') not found.")
+        st.warning(f"⚠️ {platform}: Required column ('Line item' / 'Package/Roadblock'/'Placement') not found.")
         return None, None
 
     # Detect metrics

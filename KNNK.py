@@ -7,12 +7,16 @@ import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Prophet — optional: app degrades gracefully if not installed
+# Prophet — loaded lazily with clear error messaging
+PROPHET_OK = False
+PROPHET_ERROR = ""
 try:
     from prophet import Prophet
     PROPHET_OK = True
 except ImportError:
-    PROPHET_OK = False
+    PROPHET_ERROR = "Prophet is not installed. Add `prophet` to your requirements.txt and redeploy."
+except Exception as e:
+    PROPHET_ERROR = f"Prophet failed to load: {e}"
 
 # ============================================================
 # PAGE CONFIG
@@ -224,10 +228,8 @@ def process_data(df, platform, campaign, date_range=None):
         col_name = "Line item"
     elif "Package/Roadblock" in n_df.columns:
         col_name = "Package/Roadblock"
-    elif "Placement" in n_df.columns:
-        col_name = "Placement"
     else:
-        st.warning(f"⚠️ {platform}: Required column ('Line item' / 'Package/Roadblock' / 'Placement') not found.")
+        st.warning(f"⚠️ {platform}: Required column ('Line item' / 'Package/Roadblock') not found.")
         return None, None
 
     if platform == "GAM":
@@ -368,7 +370,7 @@ def forecast_platform(n_df_json, product, periods, platform):
     if not PROPHET_OK:
         return None
 
-    n_df     = pd.read_json(n_df_json)
+    n_df     = pd.read_json(io.StringIO(n_df_json))
     date_col = next((c for c in n_df.columns if "date" in c.lower()), None)
     if not date_col:
         return None
@@ -781,7 +783,32 @@ with tab_forecast:
                 unsafe_allow_html=True)
 
     if not PROPHET_OK:
-        st.error("Prophet is not installed. Run:  `pip install prophet`  then restart the app.")
+        st.error(f"⚠️ {PROPHET_ERROR}")
+        st.markdown("""
+**How to fix — pick your setup:**
+
+**Streamlit Cloud** *(most common)*
+1. Add `prophet` to your `requirements.txt` file in your GitHub repo
+2. Push → Streamlit Cloud auto-redeploys and installs it
+
+**Local — Mac**
+```bash
+brew install gcc
+pip install prophet
+```
+
+**Local — Windows** *(conda recommended)*
+```bash
+conda install -c conda-forge prophet
+```
+
+**Local — Linux / Ubuntu**
+```bash
+sudo apt-get install -y gcc g++
+pip install prophet
+```
+Then restart the app.
+""")
         st.stop()
 
     # Check data availability

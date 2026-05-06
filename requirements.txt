@@ -3,4 +3,5 @@ pandas
 numpy
 gspread
 google-auth
+prophet
 openpyxl

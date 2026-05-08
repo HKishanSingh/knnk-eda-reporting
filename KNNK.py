@@ -6,9 +6,14 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
+import logging
+
+# Suppress noisy loggers globally
+logging.getLogger("prophet").setLevel(logging.ERROR)
+logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
 
 # Prophet — loaded lazily with clear error messaging
-PROPHET_OK = False
+PROPHET_OK    = False
 PROPHET_ERROR = ""
 try:
     from prophet import Prophet
@@ -97,7 +102,7 @@ except Exception as e:
 
 # ============================================================
 # MAPPING HELPERS
-# Keys stored as  "GAM::Direct-NA-26-1641"  →  {kw: val}
+# Keys stored as "GAM::Direct-NA-26-1641" → {kw: val}
 # ============================================================
 def load_mappings():
     if not SHEET_OK:
@@ -210,11 +215,31 @@ dynamic_campaigns = [
 all_options = sorted(set(DEFAULT_OPTIONS + dynamic_campaigns))
 
 # ============================================================
+# TOTAL ROW FILTER HELPER
+# Silently removes Grand Total / summary rows before grouping
+# ============================================================
+TOTAL_KEYWORDS = ["total", "grand total", "subtotal", "sum", "overall"]
+
+def remove_total_rows(df, col_name):
+    mask = df[col_name].astype(str).str.strip().str.lower().apply(
+        lambda v: any(v == kw or v.startswith(kw) for kw in TOTAL_KEYWORDS)
+    )
+    return df[~mask].copy(), int(mask.sum())
+
+# ============================================================
 # CORE PROCESSING
 # ============================================================
 def process_data(df, platform, campaign, date_range=None):
     n_df = df.copy()
 
+    # Remove any Grand Total rows across ALL columns first
+    n_df = n_df[
+        ~n_df.astype(str)
+        .apply(lambda col: col.str.contains("Grand Total", case=False, na=False))
+        .any(axis=1)
+    ]
+
+    # Date filter
     if date_range:
         dc = next((c for c in n_df.columns if "date" in c.lower()), None)
         if dc:
@@ -224,6 +249,7 @@ def process_data(df, platform, campaign, date_range=None):
 
     n_df["Product"] = "Ignore"
 
+    # Detect line-item column
     if "Line item" in n_df.columns:
         col_name = "Line item"
     elif "Package/Roadblock" in n_df.columns:
@@ -234,6 +260,12 @@ def process_data(df, platform, campaign, date_range=None):
         st.warning(f"⚠️ {platform}: Required column ('Line item' / 'Package/Roadblock' / 'Placement') not found.")
         return None, None
 
+    n_df[col_name] = n_df[col_name].fillna("").astype(str)
+
+    # Silently strip total/summary rows from the line-item column
+    n_df, _ = remove_total_rows(n_df, col_name)
+
+    # Detect metric columns
     if platform == "GAM":
         imp_col   = "Ad server impressions" if "Ad server impressions" in n_df.columns else "Impressions"
         click_col = "Ad server clicks"      if "Ad server clicks"      in n_df.columns else "Clicks"
@@ -244,13 +276,14 @@ def process_data(df, platform, campaign, date_range=None):
         st.warning(f"⚠️ {platform}: Columns '{imp_col}'/'{click_col}' not found.")
         return None, None
 
-    n_df[col_name] = n_df[col_name].fillna("").astype(str)
+    # Remove test rows
     before  = len(n_df)
     n_df    = n_df[~n_df[col_name].str.lower().str.contains("test", na=False)]
     removed = before - len(n_df)
     if removed:
         st.info(f"🧹 {platform}: Removed {removed} 'test' row(s)")
 
+    # Apply keyword mappings
     active = get_active_mappings(platform, campaign)
     n_df["_cl"] = n_df[col_name].str.lower()
     for key, value in active.items():
@@ -360,37 +393,65 @@ def generate_insights(df, platform=""):
     return insights
 
 # ============================================================
+# MAPE ACCURACY HELPER
+# ============================================================
+def compute_mape_accuracy(actual_series, predicted_series):
+    df = pd.DataFrame({"actual": actual_series, "predicted": predicted_series}).dropna()
+    df = df[df["actual"] > 0]
+    if df.empty:
+        return None
+    mape     = (abs(df["actual"] - df["predicted"]) / df["actual"]).mean() * 100
+    accuracy = max(0.0, 100.0 - mape)
+    return round(accuracy, 1)
+
+# ============================================================
 # PROPHET FORECASTING ENGINE
+# Returns (forecast_df, accuracy_dict) or (None, None)
+#
+# HOW LOW / HIGH ARE CALCULATED (for management explanation):
+# ─────────────────────────────────────────────────────────────
+# Prophet fits a trend + weekly seasonality model to your
+# historical daily data. For every future date it outputs:
+#
+#   Predicted  = the model's best estimate (the centre line)
+#   Low        = pessimistic bound  (actual could be this low)
+#   High       = optimistic bound   (actual could be this high)
+#
+# The Low/High form an 80% confidence interval, meaning:
+# "We are 80% confident the real number will fall between
+#  Low and High on that day."
+#
+# Example from screenshot (2026-05-04):
+#   GAM_Impressions      = 6,255  ← best guess
+#   GAM_Impressions_Low  = 5,081  ← worst-case (pessimistic)
+#   GAM_Impressions_High = 7,409  ← best-case  (optimistic)
+#
+# The width of the band grows the further out you forecast,
+# because uncertainty increases over time.
 # ============================================================
 @st.cache_data(show_spinner=False)
 def forecast_platform(n_df_json, product, periods, platform):
-    """
-    Cached Prophet forecast.
-    Accepts JSON-serialised dataframe to allow caching.
-    Returns merged forecast dataframe or None.
-    """
     if not PROPHET_OK:
-        return None
+        return None, None
 
     n_df     = pd.read_json(io.StringIO(n_df_json))
     date_col = next((c for c in n_df.columns if "date" in c.lower()), None)
     if not date_col:
-        return None
+        return None, None
 
     n_df[date_col] = pd.to_datetime(n_df[date_col], errors="coerce")
     df = n_df[n_df["Product"] == product].copy()
     if df.empty:
-        return None
+        return None, None
 
     imp_col = next((c for c in df.columns if "impression" in c.lower()), None)
     clk_col = next((c for c in df.columns if "click"      in c.lower()), None)
     if not imp_col or not clk_col:
-        return None
+        return None, None
 
-    # Need at least 2 data points for Prophet
     grp = df.groupby(date_col)[[imp_col, clk_col]].sum().reset_index()
     if len(grp) < 2:
-        return None
+        return None, None
 
     imp_df = grp[[date_col, imp_col]].rename(columns={date_col: "ds", imp_col: "y"})
     clk_df = grp[[date_col, clk_col]].rename(columns={date_col: "ds", clk_col: "y"})
@@ -401,38 +462,47 @@ def forecast_platform(n_df_json, product, periods, platform):
         m_clk = Prophet(daily_seasonality=True, yearly_seasonality=False,
                         weekly_seasonality=True, interval_width=0.80)
 
-        import logging
-        logging.getLogger("prophet").setLevel(logging.ERROR)
-        logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
-
         m_imp.fit(imp_df)
         m_clk.fit(clk_df)
 
         fut_imp = m_imp.make_future_dataframe(periods=periods)
         fut_clk = m_clk.make_future_dataframe(periods=periods)
 
-        fc_imp = m_imp.predict(fut_imp)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
-        fc_clk = m_clk.predict(fut_clk)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+        fc_imp = m_imp.predict(fut_imp)
+        fc_clk = m_clk.predict(fut_clk)
 
-        fc_imp = fc_imp.rename(columns={
+        # Accuracy: compare in-sample fitted vs actuals
+        hist_imp = imp_df.merge(fc_imp[["ds", "yhat"]], on="ds", how="inner")
+        hist_clk = clk_df.merge(fc_clk[["ds", "yhat"]], on="ds", how="inner")
+
+        accuracy = {
+            "Impressions": compute_mape_accuracy(hist_imp["y"], hist_imp["yhat"]),
+            "Clicks":      compute_mape_accuracy(hist_clk["y"], hist_clk["yhat"])
+        }
+
+        # Build output — rename ds → Date for readability
+        fc_imp_out = fc_imp[["ds", "yhat", "yhat_lower", "yhat_upper"]].rename(columns={
+            "ds":         "Date",
             "yhat":       f"{platform}_Impressions",
             "yhat_lower": f"{platform}_Impressions_Low",
             "yhat_upper": f"{platform}_Impressions_High"
         })
-        fc_clk = fc_clk.rename(columns={
+        fc_clk_out = fc_clk[["ds", "yhat", "yhat_lower", "yhat_upper"]].rename(columns={
+            "ds":         "Date",
             "yhat":       f"{platform}_Clicks",
             "yhat_lower": f"{platform}_Clicks_Low",
             "yhat_upper": f"{platform}_Clicks_High"
         })
 
-        merged = fc_imp.merge(fc_clk, on="ds")
-        # Clip negatives to 0
+        merged = fc_imp_out.merge(fc_clk_out, on="Date")
         for col in merged.columns:
-            if col != "ds":
-                merged[col] = merged[col].clip(lower=0).round(0)
-        return merged
+            if col != "Date":
+                merged[col] = merged[col].clip(lower=0).round(0).astype(int)
+
+        return merged, accuracy
+
     except Exception:
-        return None
+        return None, None
 
 # ============================================================
 # FILE READER HELPER
@@ -699,8 +769,8 @@ with tab_main:
             return
         n_df = n_df.copy()
         n_df[dc] = pd.to_datetime(n_df[dc], errors="coerce")
-        trend    = n_df.groupby(dc)[ic].sum().reset_index().sort_values(dc)
-        trend    = trend.rename(columns={ic: f"{platform} Impressions"})
+        trend = n_df.groupby(dc)[ic].sum().reset_index().sort_values(dc)
+        trend = trend.rename(columns={ic: f"{platform} Impressions"})
         if len(trend) > 1:
             st.caption(f"{platform} Impression Trend")
             st.line_chart(trend.set_index(dc))
@@ -790,7 +860,7 @@ with tab_forecast:
 **How to fix — pick your setup:**
 
 **Streamlit Cloud** *(most common)*
-1. Add `prophet` to your `requirements.txt` file in your GitHub repo
+1. Add `prophet` to your `requirements.txt` in your GitHub repo
 2. Push → Streamlit Cloud auto-redeploys and installs it
 
 **Local — Mac**
@@ -813,161 +883,240 @@ Then restart the app.
 """)
         st.stop()
 
-    # Check data availability
     has_gam = gam_clean is not None and "Product" in gam_clean.columns
     has_dcm = dcm_clean is not None and "Product" in dcm_clean.columns
 
+    def has_date(df):
+        return df is not None and any("date" in c.lower() for c in df.columns)
+
     if not has_gam and not has_dcm:
-        st.info("Upload at least one file (GAM or DCM) in the **Reporting** tab first, then come back here.")
+        st.info("Upload at least one file (GAM or DCM) in the **Reporting** tab first.")
+    elif not has_date(gam_clean) and not has_date(dcm_clean):
+        st.warning("⚠️ No date column found. Forecasting requires a date column.")
     else:
-        # ── Check date columns exist
-        def has_date(df):
-            return df is not None and any("date" in c.lower() for c in df.columns)
+        # ── How Low / High work — management-friendly explanation
+        with st.expander("📖 How to read this forecast", expanded=False):
+            st.markdown("""
+### What do the columns mean?
 
-        if not has_date(gam_clean) and not has_date(dcm_clean):
-            st.warning("⚠️ No date column found in the uploaded file(s). Forecasting requires a date column.")
+| Column | Plain English |
+|---|---|
+| **Date** | The calendar day being forecast |
+| **GAM_Impressions** | Our best single estimate of impressions for that day |
+| **GAM_Impressions_Low** | The pessimistic / worst-case estimate (things go slower than usual) |
+| **GAM_Impressions_High** | The optimistic / best-case estimate (things go better than usual) |
+| **GAM_Clicks** | Our best single estimate of clicks for that day |
+| **GAM_Clicks_Low / High** | Same pessimistic / optimistic range for clicks |
+
+---
+
+### How are Low and High calculated?
+
+The forecast uses **Meta's Prophet model**, which learns the weekly and daily patterns from your historical data.
+
+For every future date it produces **three numbers**:
+- **Predicted** (centre) — the model's best guess, based on the trend and seasonality it observed
+- **Low** — a pessimistic scenario where performance dips below the recent trend
+- **High** — an optimistic scenario where performance exceeds the recent trend
+
+Together, Low and High form an **80% confidence interval** — meaning:
+
+> *"We are 80% confident the real number on that day will fall somewhere between Low and High."*
+
+---
+
+### Real example from your data (2026-05-04)
+
+| | Value |
+|---|---|
+| GAM_Impressions | **6,255** ← most likely |
+| GAM_Impressions_Low | **5,081** ← if it underperforms |
+| GAM_Impressions_High | **7,409** ← if it overperforms |
+
+So you can tell management:
+> *"We expect around 6,255 GAM impressions on May 4th. In a conservative scenario it could be as low as 5,081, and in an optimistic scenario as high as 7,409."*
+
+---
+
+### Why does the band get wider over time?
+
+The further into the future you forecast, the more uncertainty builds up — like a weather forecast that is very reliable for tomorrow but much less so for 2 weeks out. This is why **7–14 day forecasts are more reliable than 21–30 day ones**.
+
+---
+
+### Accuracy %
+
+After running the model, you'll see an **Accuracy %** score per metric. This is measured by comparing what the model *would have predicted* on your historical dates against what *actually happened*:
+
+- **≥ 80%** → Good fit — reliable for planning
+- **60–79%** → Fair fit — use as a guide, not a guarantee
+- **< 60%** → Low fit — historical data may be too short or inconsistent
+""")
+
+        # ── Product list
+        all_products = set()
+        if has_gam:
+            all_products.update(
+                gam_clean[gam_clean["Product"] != "Ignore"]["Product"].dropna().unique()
+            )
+        if has_dcm:
+            all_products.update(
+                dcm_clean[dcm_clean["Product"] != "Ignore"]["Product"].dropna().unique()
+            )
+        all_products = sorted(all_products)
+
+        if not all_products:
+            st.warning("⚠️ No mapped products found. Check your mappings.")
         else:
-            # ── Product list (union of both platforms, excluding Ignore)
-            all_products = set()
-            if has_gam:
-                all_products.update(
-                    gam_clean[gam_clean["Product"] != "Ignore"]["Product"].dropna().unique()
+            st.markdown('<div class="section-title">Forecast Settings</div>', unsafe_allow_html=True)
+
+            fc1, fc2, fc3 = st.columns([3, 1, 1])
+            with fc1:
+                sel_product = st.selectbox(
+                    "Select Product to Forecast",
+                    all_products,
+                    help="Forecasts run independently per platform."
                 )
-            if has_dcm:
-                all_products.update(
-                    dcm_clean[dcm_clean["Product"] != "Ignore"]["Product"].dropna().unique()
+            with fc2:
+                forecast_days = st.selectbox(
+                    "Forecast Days",
+                    [7, 14, 21, 30],
+                    index=0,
+                    help="7–14 days is most reliable."
                 )
-            all_products = sorted(all_products)
+            with fc3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                run_btn = st.button("🚀 Run Forecast", use_container_width=True)
 
-            if not all_products:
-                st.warning("⚠️ No mapped products found. Check your mappings.")
-            else:
-                # ── Controls
-                st.markdown('<div class="section-title">Forecast Settings</div>',
-                            unsafe_allow_html=True)
+            # Both captions restored
+            st.caption("📌 Forecast accuracy is highest for 7–14 day horizons based on historical patterns.")
+            st.caption("📌 Accuracy % = 100 − MAPE, measured on historical in-sample data. Higher is better.")
 
-                fc1, fc2, fc3 = st.columns([3, 1, 1])
-                with fc1:
-                    sel_product = st.selectbox(
-                        "Select Product to Forecast",
-                        all_products,
-                        help="Choose a mapped product. Forecasts run independently per platform."
-                    )
-                with fc2:
-                    forecast_days = st.selectbox(
-                        "Forecast Days",
-                        [7, 14, 21, 30],
-                        index=0,
-                        help="How many future days to predict. 7–14 days is most reliable."
-                    )
-                with fc3:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    run_btn = st.button("🚀 Run Forecast", use_container_width=True)
+            if run_btn:
+                gam_fc, gam_acc = None, None
+                dcm_fc, dcm_acc = None, None
+                final_forecast  = None
 
-                st.caption("📌 Forecast accuracy is highest for 7–14 day horizons based on historical patterns.")
+                with st.spinner("Running forecast models… this may take 10–30 seconds."):
 
-                if run_btn:
-                    gam_fc, dcm_fc = None, None
-                    final_forecast = None
-
-                    with st.spinner("Running forecast models… this may take 10–30 seconds."):
-
-                        # GAM forecast
-                        if has_gam and has_date(gam_clean):
-                            gam_fc = forecast_platform(
-                                gam_clean.to_json(),
-                                sel_product,
-                                forecast_days,
-                                "GAM"
-                            )
-                            if gam_fc is None:
-                                st.warning("⚠️ GAM: Not enough historical data for this product to forecast.")
-
-                        # DCM forecast
-                        if has_dcm and has_date(dcm_clean):
-                            dcm_fc = forecast_platform(
-                                dcm_clean.to_json(),
-                                sel_product,
-                                forecast_days,
-                                "DCM"
-                            )
-                            if dcm_fc is None:
-                                st.warning("⚠️ DCM: Not enough historical data for this product to forecast.")
-
-                        # Merge results
-                        if gam_fc is not None and dcm_fc is not None:
-                            final_forecast = gam_fc.merge(dcm_fc, on="ds", how="outer")
-                        elif gam_fc is not None:
-                            final_forecast = gam_fc
-                        elif dcm_fc is not None:
-                            final_forecast = dcm_fc
-
-                    if final_forecast is not None:
-                        final_forecast = final_forecast.sort_values("ds").reset_index(drop=True)
-                        final_forecast["ds"] = pd.to_datetime(final_forecast["ds"]).dt.date
-
-                        st.success(f"✅ Forecast complete — {forecast_days} day horizon for **{sel_product}**")
-
-                        # ── Metric summary for the forecast period only
-                        future_only = final_forecast.tail(forecast_days)
-
-                        st.markdown('<div class="section-title">Forecast Summary — Future Period</div>',
-                                    unsafe_allow_html=True)
-
-                        summary_cols = st.columns(4)
-                        col_idx = 0
-                        for platform in ["GAM", "DCM"]:
-                            ic = f"{platform}_Impressions"
-                            cc = f"{platform}_Clicks"
-                            if ic in future_only.columns:
-                                summary_cols[col_idx].metric(
-                                    f"{platform} Total Imp (forecast)",
-                                    f"{int(future_only[ic].sum()):,}"
-                                )
-                                col_idx += 1
-                            if cc in future_only.columns:
-                                summary_cols[col_idx].metric(
-                                    f"{platform} Total Clicks (forecast)",
-                                    f"{int(future_only[cc].sum()):,}"
-                                )
-                                col_idx += 1
-
-                        # ── Full table (historical + forecast)
-                        st.markdown('<div class="section-title">Full Forecast Table</div>',
-                                    unsafe_allow_html=True)
-                        st.caption("Rows include historical fitted values + future predictions. Confidence interval columns (_Low / _High) show 80% range.")
-                        st.dataframe(final_forecast, use_container_width=True)
-
-                        # ── Charts: Impressions
-                        imp_cols = [c for c in final_forecast.columns
-                                    if "impression" in c.lower() and "low" not in c.lower() and "high" not in c.lower()]
-                        if imp_cols:
-                            st.markdown('<div class="section-title">📈 Impression Forecast Trend</div>',
-                                        unsafe_allow_html=True)
-                            st.line_chart(final_forecast.set_index("ds")[imp_cols])
-
-                        # ── Charts: Clicks
-                        clk_cols = [c for c in final_forecast.columns
-                                    if "click" in c.lower() and "low" not in c.lower() and "high" not in c.lower()]
-                        if clk_cols:
-                            st.markdown('<div class="section-title">🖱️ Click Forecast Trend</div>',
-                                        unsafe_allow_html=True)
-                            st.line_chart(final_forecast.set_index("ds")[clk_cols])
-
-                        # ── Download forecast
-                        st.markdown('<div class="section-title">Download</div>', unsafe_allow_html=True)
-                        buf = io.BytesIO()
-                        final_forecast.to_excel(buf, index=False)
-                        buf.seek(0)
-                        st.download_button(
-                            "⬇️ Download Forecast Excel",
-                            data=buf,
-                            file_name=f"{option}_{sel_product}_forecast_{forecast_days}d.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
+                    if has_gam and has_date(gam_clean):
+                        gam_fc, gam_acc = forecast_platform(
+                            gam_clean.to_json(), sel_product, forecast_days, "GAM"
                         )
+                        if gam_fc is None:
+                            st.warning("⚠️ GAM: Not enough historical data for this product.")
 
-                        st.caption("⚠️ Predictions are based on historical trends and may vary. Use as a directional guide, not a guarantee.")
+                    if has_dcm and has_date(dcm_clean):
+                        dcm_fc, dcm_acc = forecast_platform(
+                            dcm_clean.to_json(), sel_product, forecast_days, "DCM"
+                        )
+                        if dcm_fc is None:
+                            st.warning("⚠️ DCM: Not enough historical data for this product.")
+
+                    if gam_fc is not None and dcm_fc is not None:
+                        final_forecast = gam_fc.merge(dcm_fc, on="Date", how="outer")
+                    elif gam_fc is not None:
+                        final_forecast = gam_fc
+                    elif dcm_fc is not None:
+                        final_forecast = dcm_fc
+
+                if final_forecast is not None:
+                    final_forecast = final_forecast.sort_values("Date").reset_index(drop=True)
+                    final_forecast["Date"] = pd.to_datetime(final_forecast["Date"]).dt.date
+
+                    st.success(f"✅ Forecast complete — {forecast_days} day horizon for **{sel_product}**")
+
+                    # ── Accuracy scores
+                    st.markdown('<div class="section-title">🎯 Model Accuracy (Historical Fit)</div>',
+                                unsafe_allow_html=True)
+                    st.caption("How closely the model fits your historical data. ≥80% = Good · 60–79% = Fair · <60% = Low")
+
+                    acc_cols = st.columns(4)
+                    col_idx  = 0
+                    for plat, acc in [("GAM", gam_acc), ("DCM", dcm_acc)]:
+                        if acc:
+                            for metric in ["Impressions", "Clicks"]:
+                                val = acc.get(metric)
+                                if val is not None and col_idx < 4:
+                                    fit_label = "Good fit ✅" if val >= 80 else ("Fair fit ⚠️" if val >= 60 else "Low fit ❌")
+                                    acc_cols[col_idx].metric(
+                                        f"{plat} {metric} Accuracy",
+                                        f"{val}%",
+                                        delta=fit_label,
+                                        delta_color="normal" if val >= 80 else "off"
+                                    )
+                                    col_idx += 1
+
+                    if col_idx == 0:
+                        st.info("Accuracy scores not available — historical data may be too sparse.")
+
+                    # ── Future period summary
+                    future_only = final_forecast.tail(forecast_days)
+                    st.markdown('<div class="section-title">Forecast Summary — Next Period</div>',
+                                unsafe_allow_html=True)
+                    summary_cols = st.columns(4)
+                    sidx = 0
+                    for plat in ["GAM", "DCM"]:
+                        ic = f"{plat}_Impressions"
+                        cc = f"{plat}_Clicks"
+                        if ic in future_only.columns and sidx < 4:
+                            summary_cols[sidx].metric(
+                                f"{plat} Impressions (next {forecast_days}d)",
+                                f"{int(future_only[ic].sum()):,}"
+                            )
+                            sidx += 1
+                        if cc in future_only.columns and sidx < 4:
+                            summary_cols[sidx].metric(
+                                f"{plat} Clicks (next {forecast_days}d)",
+                                f"{int(future_only[cc].sum()):,}"
+                            )
+                            sidx += 1
+
+                    # ── Full table
+                    st.markdown('<div class="section-title">Full Forecast Table</div>',
+                                unsafe_allow_html=True)
+                    st.caption(
+                        "Date = calendar day · Predicted = best estimate · "
+                        "_Low = pessimistic scenario · _High = optimistic scenario · "
+                        "80% confidence: actual will land between Low and High on 4 out of 5 days."
+                    )
+                    st.dataframe(final_forecast, use_container_width=True)
+
+                    # ── Charts
+                    imp_cols = [c for c in final_forecast.columns
+                                if "impression" in c.lower()
+                                and "low" not in c.lower()
+                                and "high" not in c.lower()]
+                    if imp_cols:
+                        st.markdown('<div class="section-title">📈 Impression Forecast Trend</div>',
+                                    unsafe_allow_html=True)
+                        st.caption("Solid line = predicted. The actual result is expected to stay within the Low–High band 80% of the time.")
+                        st.line_chart(final_forecast.set_index("Date")[imp_cols])
+
+                    clk_cols = [c for c in final_forecast.columns
+                                if "click" in c.lower()
+                                and "low" not in c.lower()
+                                and "high" not in c.lower()]
+                    if clk_cols:
+                        st.markdown('<div class="section-title">🖱️ Click Forecast Trend</div>',
+                                    unsafe_allow_html=True)
+                        st.caption("Solid line = predicted. The actual result is expected to stay within the Low–High band 80% of the time.")
+                        st.line_chart(final_forecast.set_index("Date")[clk_cols])
+
+                    # ── Download
+                    st.markdown('<div class="section-title">Download</div>', unsafe_allow_html=True)
+                    buf = io.BytesIO()
+                    final_forecast.to_excel(buf, index=False)
+                    buf.seek(0)
+                    st.download_button(
+                        "⬇️ Download Forecast Excel",
+                        data=buf,
+                        file_name=f"{option}_{sel_product}_forecast_{forecast_days}d.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+
+                    st.caption("⚠️ Predictions are directional estimates based on historical trends. Accuracy % reflects in-sample model fit, not guaranteed future performance.")
 
 # ──────────────────────────────────────────────────────────────
 # TAB 5 — RECONCILIATION

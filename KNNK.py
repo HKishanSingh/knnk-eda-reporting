@@ -82,7 +82,7 @@ def get_gsheet_client():
 
 @st.cache_resource
 def get_sheet(_client):
-    return _client.open("Reporting with KNNK EDA App").sheet1
+    return _client.open("Reporting with KN & NK EDA App").sheet1
 
 try:
     _client  = get_gsheet_client()

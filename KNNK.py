@@ -39,7 +39,7 @@ EMPTY_DQ = {"n_days": 0, "is_sufficient": False, "warnings": [], "quality": "blo
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="KN & NK SmartReport Engine App",
+    page_title="KN & NK EDA Reporting App",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -61,7 +61,7 @@ div[data-testid="stDataFrame"] { width: 100% !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 KN & NK SmartReport Engine App")
+st.title("📊 KN & NK EDA Reporting App")
 st.caption("GAM + DCM Reconciliation · Campaign Mapping · Insights · Prophet & XGBoost Forecast · Trend Analysis")
 st.divider()
 
@@ -178,59 +178,123 @@ all_options = sorted(set(DEFAULT_OPTIONS + dynamic_campaigns))
 TOTAL_KEYWORDS = ["total","grand total","subtotal","sum","overall"]
 
 def remove_total_rows(df, col_name):
-    mask = df[col_name].astype(str).str.strip().str.lower().apply(
-        lambda v: any(v == kw or v.startswith(kw) for kw in TOTAL_KEYWORDS))
-    return df[~mask].copy(), int(mask.sum())
+    """Safely remove summary/total rows. Handles empty DataFrames. Never raises."""
+    try:
+        if df.empty or col_name not in df.columns:
+            return df.copy(), 0
+        col_str = df[col_name].fillna("").astype(str).str.strip().str.lower()
+        if col_str.empty:
+            return df.copy(), 0
+        mask = col_str.apply(
+            lambda v: any(v == kw or v.startswith(kw) for kw in TOTAL_KEYWORDS)
+        )
+        return df[~mask].copy(), int(mask.sum())
+    except Exception:
+        return df.copy(), 0
 
 # ============================================================
 # CORE PROCESSING
 # ============================================================
 def process_data(df, platform, campaign, date_range=None):
-    n_df = df.copy()
-    n_df = n_df[~n_df.astype(str)
-                .apply(lambda col: col.str.contains("Grand Total", case=False, na=False))
-                .any(axis=1)]
-    if date_range:
-        dc = next((c for c in n_df.columns if "date" in c.lower()), None)
-        if dc:
-            n_df[dc] = pd.to_datetime(n_df[dc], errors="coerce")
-            s, e = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
-            n_df = n_df[(n_df[dc] >= s) & (n_df[dc] <= e)]
-    n_df["Product"] = "Ignore"
-    if   "Line item"         in n_df.columns: col_name = "Line item"
-    elif "Package/Roadblock" in n_df.columns: col_name = "Package/Roadblock"
-    elif "Placement"         in n_df.columns: col_name = "Placement"
-    else:
-        st.warning(f"⚠️ {platform}: Required column not found.")
-        return None, None
-    n_df[col_name] = n_df[col_name].fillna("").astype(str)
-    n_df, _ = remove_total_rows(n_df, col_name)
-    if platform == "GAM":
-        imp_col   = "Ad server impressions" if "Ad server impressions" in n_df.columns else "Impressions"
-        click_col = "Ad server clicks"      if "Ad server clicks"      in n_df.columns else "Clicks"
-    else:
-        imp_col, click_col = "Impressions", "Clicks"
-    if imp_col not in n_df.columns or click_col not in n_df.columns:
-        st.warning(f"⚠️ {platform}: Metric columns not found.")
-        return None, None
-    before = len(n_df)
-    n_df   = n_df[~n_df[col_name].str.lower().str.contains("test", na=False)]
-    if before - len(n_df):
-        st.info(f"🧹 {platform}: Removed {before - len(n_df)} 'test' row(s)")
-    active = get_active_mappings(platform, campaign)
-    n_df["_cl"] = n_df[col_name].str.lower()
-    for key, value in active.items():
-        kc = str(key).strip().lower()
-        if kc:
-            n_df.loc[n_df["_cl"].apply(lambda x: kc in x), "Product"] = value
-    n_df.drop(columns=["_cl"], inplace=True)
-    result = n_df.groupby("Product")[[imp_col, click_col]].sum().reset_index()
-    result = result.rename(columns={imp_col: f"{platform}_Impressions",
-                                    click_col: f"{platform}_Clicks"})
-    return result, n_df
+    try:
+        n_df = df.copy()
 
-# ============================================================
-# PIVOT BUILDER
+        # Remove Grand Total rows across all columns
+        try:
+            grand_mask = n_df.astype(str).apply(
+                lambda col: col.str.contains("Grand Total", case=False, na=False)
+            ).any(axis=1)
+            n_df = n_df[~grand_mask].reset_index(drop=True)
+        except Exception:
+            pass  # if it fails, continue without this filter
+
+        # Date filter — convert to string first to avoid Cloud timezone issues
+        if date_range and len(date_range) == 2 and date_range[0] and date_range[1]:
+            dc = next((c for c in n_df.columns if "date" in c.lower()), None)
+            if dc:
+                try:
+                    n_df[dc] = pd.to_datetime(n_df[dc], errors="coerce")
+                    # Strip timezone info if present (causes issues on Cloud pandas)
+                    if hasattr(n_df[dc].dtype, "tz") and n_df[dc].dtype.tz is not None:
+                        n_df[dc] = n_df[dc].dt.tz_localize(None)
+                    s = pd.to_datetime(str(date_range[0]))
+                    e = pd.to_datetime(str(date_range[1]))
+                    n_df = n_df[(n_df[dc] >= s) & (n_df[dc] <= e)].reset_index(drop=True)
+                except Exception as ex:
+                    st.warning(f"⚠️ {platform}: Date filter failed — {ex}. Showing all data.")
+
+        # Guard: nothing left after filters
+        if n_df.empty:
+            st.warning(
+                f"⚠️ {platform}: No data remains after applying filters. "
+                f"Check your date range or file contents."
+            )
+            return None, None
+
+        n_df["Product"] = "Ignore"
+
+        # Detect line-item column
+        if   "Line item"         in n_df.columns: col_name = "Line item"
+        elif "Package/Roadblock" in n_df.columns: col_name = "Package/Roadblock"
+        elif "Placement"         in n_df.columns: col_name = "Placement"
+        else:
+            st.warning(
+                f"⚠️ {platform}: Required column "
+                f"('Line item' / 'Package/Roadblock' / 'Placement') not found."
+            )
+            return None, None
+
+        n_df[col_name] = n_df[col_name].fillna("").astype(str)
+
+        # Remove total/summary rows from the line-item column
+        n_df, _ = remove_total_rows(n_df, col_name)
+
+        if n_df.empty:
+            st.warning(
+                f"⚠️ {platform}: All rows identified as summary/total rows. "
+                f"Check your data."
+            )
+            return None, None
+
+        # Detect metric columns
+        if platform == "GAM":
+            imp_col   = "Ad server impressions" if "Ad server impressions" in n_df.columns else "Impressions"
+            click_col = "Ad server clicks"      if "Ad server clicks"      in n_df.columns else "Clicks"
+        else:
+            imp_col, click_col = "Impressions", "Clicks"
+
+        if imp_col not in n_df.columns or click_col not in n_df.columns:
+            st.warning(f"⚠️ {platform}: Metric columns '{imp_col}'/'{click_col}' not found.")
+            return None, None
+
+        # Remove test rows
+        before = len(n_df)
+        n_df   = n_df[~n_df[col_name].str.lower().str.contains("test", na=False)].reset_index(drop=True)
+        removed = before - len(n_df)
+        if removed:
+            st.info(f"🧹 {platform}: Removed {removed} 'test' row(s)")
+
+        # Apply keyword mappings
+        active = get_active_mappings(platform, campaign)
+        n_df["_cl"] = n_df[col_name].str.lower()
+        for key, value in active.items():
+            kc = str(key).strip().lower()
+            if kc:
+                n_df.loc[n_df["_cl"].apply(lambda x: kc in x), "Product"] = value
+        n_df.drop(columns=["_cl"], inplace=True)
+
+        # Group and return
+        result = n_df.groupby("Product")[[imp_col, click_col]].sum().reset_index()
+        result = result.rename(columns={
+            imp_col:   f"{platform}_Impressions",
+            click_col: f"{platform}_Clicks"
+        })
+        return result, n_df
+
+    except Exception as ex:
+        st.error(f"❌ {platform}: Unexpected processing error — {ex}")
+        return None, None
+
 # ============================================================
 def build_pivot(n_df, platform, key_suffix=""):
     if n_df is None or "Product" not in n_df.columns:
@@ -839,9 +903,13 @@ with st.sidebar:
     date_range = None
     if apply_date:
         c1, c2 = st.columns(2)
-        with c1: sd = st.date_input("Start", key="sd")
-        with c2: ed = st.date_input("End",   key="ed")
-        date_range = (sd, ed)
+        with c1: sd = st.date_input("Start", key="date_start")
+        with c2: ed = st.date_input("End",   key="date_end")
+        if sd and ed:
+            if sd <= ed:
+                date_range = (str(sd), str(ed))
+            else:
+                st.warning("⚠️ Start date must be before or equal to End date.")
     st.divider(); st.subheader("🧮 CPM Calculator")
     budget = st.number_input("Budget ($)", min_value=0.0, step=100.0)
     impressions = st.number_input("Impressions", min_value=0.0, step=1000.0)
@@ -1024,12 +1092,12 @@ with tab_forecast:
     col_xgb_stat, col_prp_stat = st.columns(2)
     with col_xgb_stat:
         if XGB_OK:
-            st.success("✅ XGBoost — ready  (works with 7+ days of data, fast)")
+            st.success("✅ XGBoost — ready  (works with 5+ days of data, fast)")
         else:
             st.error(f"❌ XGBoost — {XGB_ERROR}")
     with col_prp_stat:
         if PROPHET_OK:
-            st.success("✅ Prophet — ready  (needs 10+ days, captures seasonality)")
+            st.success("✅ Prophet — ready  (needs 7+ days, slower but captures seasonality)")
         else:
             st.warning(f"⚠️ Prophet — {PROPHET_ERROR}")
 
@@ -1038,11 +1106,14 @@ with tab_forecast:
         st.markdown("""
 | Feature | XGBoost ⚡ | Prophet 📈 |
 |---|---|---|
-| **Minimum data** | 7 days | 10 days |
+| **Minimum data** | 5 days | 7 days |
 | **Best at** | Short campaigns, quick patterns | Long campaigns with weekly seasonality |
 | **Confidence bands** | Bootstrap residuals | Bayesian uncertainty |
+| **Speed** | Very fast (< 5 sec) | Slower (10–30 sec) |
+| **Install** | `pip install xgboost` — no compiler | Needs C++ compiler or conda |
 | **Accuracy (small data)** | Better | Can overfit or be unstable |
 | **Accuracy (28+ days)** | Good | Excellent — picks up weekly patterns |
+| **Fake 100% accuracy?** | No — uses held-out validation | No — uses held-out validation |
 
 **Recommendation:**
 - Campaign running < 3 weeks → use **XGBoost**

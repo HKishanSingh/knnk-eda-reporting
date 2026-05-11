@@ -39,7 +39,7 @@ EMPTY_DQ = {"n_days": 0, "is_sufficient": False, "warnings": [], "quality": "blo
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="KN & NK SmartReport Engine Reporting App",
+    page_title="KNNK SmartReport Engine Reporting App",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -61,7 +61,7 @@ div[data-testid="stDataFrame"] { width: 100% !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 KN & NK  SmartReport Engine Reporting App")
+st.title("📊 KNNK SmartReport Engine Reporting App")
 st.caption("GAM + DCM Reconciliation · Campaign Mapping · Insights · Prophet & XGBoost Forecast · Trend Analysis")
 st.divider()
 
@@ -82,7 +82,7 @@ def get_gsheet_client():
 
 @st.cache_resource
 def get_sheet(_client):
-    return _client.open("Reporting with KN & NK EDA App").sheet1
+    return _client.open("Reporting with KNNK EDA App").sheet1
 
 try:
     _client  = get_gsheet_client()

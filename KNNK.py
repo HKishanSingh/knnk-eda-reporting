@@ -140,18 +140,6 @@ if "show_fullview" not in st.session_state:
 # LEGACY MAPPINGS
 # ============================================================
 LEGACY_MAPPINGS = {
-    platform_key("GAM","Direct-NA-26-1641"): {
-        "Thematic_Standard":"EDit","AV_Contextual_Banners":"AV",
-        "5224631":"AI In Action On-Site Editorial Series Sponsorship (10x Editorial Articles) - Q2",
-        "5224633":"AV Contextual Banners - Q2"},
-    platform_key("GAM","Direct-NA-25-1619"): {
-        "Audience  FullScape":"Audience Targeted Custom Video Distribution FullScape Units",
-        "Audience Marquee":"Audience Targeted Custom Video Distribution Marquee and Interlude Units",
-        "Audience Interlude":"Audience Targeted Custom Video Distribution Marquee and Interlude Units",
-        "Added Value Contextually Targeted Banners":"AV"},
-    platform_key("GAM","Direct-NA-25-1608"): {
-        "Audience Standard":"CPM","Contextual Targeted Banners":"AV",
-        "Tech Standard":"Tech Section","Full Site Business Insider POE Standard":"Tech Section"},
     platform_key("GAM","Direct-NA-26-1632"): {
         "Contextual Standard":"AV",
         "Contextual Marquee":"Contextual Thematic Targeted Custom Units Marquee and Interlude",
@@ -168,11 +156,6 @@ LEGACY_MAPPINGS = {
         "Contextual_On-Site_National":"Contextual Targeted Business Insider On-Site Pre-Roll- Geo- National",
         "AV_Contextual_Banners":"AV",
         "Audience":"Audience Targeted Custom Units Marquee and Interlude Geo- National"},
-    platform_key("GAM","Direct-NA-25-1566"): {
-        "CB2 Creative_Multi":"Audience Targeted Custom Marquee and Interlude Units - CB2 Creative",
-        "C&B Creative_Multi":"Audience Targeted Custom Marquee and Interlude Units | C&B Creative",
-        "CB2 Creative_AV_Multi":"Added Value Contextually Targeted Banners CB2 Creative",
-        "C&B Creative_AV_Multi":"Added Value Contextually Targeted Banners C&B Creative"},
 }
 
 def get_active_mappings(platform, campaign):
@@ -184,8 +167,7 @@ def get_active_mappings(platform, campaign):
 # OPTIONS
 # ============================================================
 DEFAULT_OPTIONS = [
-    "Direct-NA-26-1641","Direct-NA-25-1619","Direct-NA-25-1608",
-    "Direct-NA-26-1632","Direct-NA-25-1625","Direct-NA-25-1566"
+    "Direct-NA-26-1632","Direct-NA-25-1625"
 ]
 dynamic_campaigns = [k.split("::",1)[1] for k in st.session_state.mappings if "::" in k]
 all_options = sorted(set(DEFAULT_OPTIONS + dynamic_campaigns))

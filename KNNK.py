@@ -39,7 +39,7 @@ EMPTY_DQ = {"n_days": 0, "is_sufficient": False, "warnings": [], "quality": "blo
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="KN & NK EDA Reporting App",
+    page_title="KN & NK SmartReport Engine Reporting App",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -61,7 +61,7 @@ div[data-testid="stDataFrame"] { width: 100% !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 KN & NK EDA Reporting App")
+st.title("📊 KN & NK  SmartReport Engine Reporting App")
 st.caption("GAM + DCM Reconciliation · Campaign Mapping · Insights · Prophet & XGBoost Forecast · Trend Analysis")
 st.divider()
 
@@ -140,6 +140,18 @@ if "show_fullview" not in st.session_state:
 # LEGACY MAPPINGS
 # ============================================================
 LEGACY_MAPPINGS = {
+    platform_key("GAM","Direct-NA-26-1641"): {
+        "Thematic_Standard":"EDit","AV_Contextual_Banners":"AV",
+        "5224631":"AI In Action On-Site Editorial Series Sponsorship (10x Editorial Articles) - Q2",
+        "5224633":"AV Contextual Banners - Q2"},
+    platform_key("GAM","Direct-NA-25-1619"): {
+        "Audience  FullScape":"Audience Targeted Custom Video Distribution FullScape Units",
+        "Audience Marquee":"Audience Targeted Custom Video Distribution Marquee and Interlude Units",
+        "Audience Interlude":"Audience Targeted Custom Video Distribution Marquee and Interlude Units",
+        "Added Value Contextually Targeted Banners":"AV"},
+    platform_key("GAM","Direct-NA-25-1608"): {
+        "Audience Standard":"CPM","Contextual Targeted Banners":"AV",
+        "Tech Standard":"Tech Section","Full Site Business Insider POE Standard":"Tech Section"},
     platform_key("GAM","Direct-NA-26-1632"): {
         "Contextual Standard":"AV",
         "Contextual Marquee":"Contextual Thematic Targeted Custom Units Marquee and Interlude",
@@ -156,6 +168,11 @@ LEGACY_MAPPINGS = {
         "Contextual_On-Site_National":"Contextual Targeted Business Insider On-Site Pre-Roll- Geo- National",
         "AV_Contextual_Banners":"AV",
         "Audience":"Audience Targeted Custom Units Marquee and Interlude Geo- National"},
+    platform_key("GAM","Direct-NA-25-1566"): {
+        "CB2 Creative_Multi":"Audience Targeted Custom Marquee and Interlude Units - CB2 Creative",
+        "C&B Creative_Multi":"Audience Targeted Custom Marquee and Interlude Units | C&B Creative",
+        "CB2 Creative_AV_Multi":"Added Value Contextually Targeted Banners CB2 Creative",
+        "C&B Creative_AV_Multi":"Added Value Contextually Targeted Banners C&B Creative"},
 }
 
 def get_active_mappings(platform, campaign):
@@ -167,7 +184,8 @@ def get_active_mappings(platform, campaign):
 # OPTIONS
 # ============================================================
 DEFAULT_OPTIONS = [
-    "Direct-NA-26-1632","Direct-NA-25-1625"
+    "Direct-NA-26-1641","Direct-NA-25-1619","Direct-NA-25-1608",
+    "Direct-NA-26-1632","Direct-NA-25-1625","Direct-NA-25-1566"
 ]
 dynamic_campaigns = [k.split("::",1)[1] for k in st.session_state.mappings if "::" in k]
 all_options = sorted(set(DEFAULT_OPTIONS + dynamic_campaigns))
@@ -403,8 +421,16 @@ def _make_dq(n_days, platform, model="xgb"):
 # SHARED ACCURACY HELPER  (held-out validation, model-agnostic)
 # ============================================================
 def _mape_accuracy(y_true, y_pred):
-    valid = y_true > 0
-    if not valid.any():
+    """
+    Honest held-out MAPE accuracy.
+    Returns None when data is too sparse for a reliable score
+    (avoids showing 0.0% for near-zero click series).
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    valid  = y_true > 0
+    # If fewer than half the holdout values are nonzero, accuracy is unreliable
+    if valid.sum() < max(1, len(y_true) // 2):
         return None
     mape = (np.abs(y_true[valid] - y_pred[valid]) / y_true[valid]).mean() * 100
     return round(max(0.0, 100.0 - mape), 1)
@@ -448,7 +474,8 @@ def _xgb_holdout_accuracy(grp, date_col, value_col, periods):
         y  = df[value_col]
         X  = pd.concat([_build_features(df[date_col]), _add_lag_features(y, nl)], axis=1)
         m  = XGBRegressor(n_estimators=200, max_depth=3, learning_rate=0.05,
-                          subsample=0.8, colsample_bytree=0.8, random_state=42, verbosity=0)
+                          subsample=1.0, colsample_bytree=1.0,
+                          random_state=42, nthread=1, verbosity=0)
         m.fit(X.iloc[:nt], y.iloc[:nt], verbose=False)
         preds = m.predict(X.iloc[nt:])
         acc   = _mape_accuracy(y.iloc[nt:].values, preds)
@@ -501,9 +528,12 @@ def forecast_xgb(n_df_json: str, product: str, periods: int, platform: str):
     base_f = _build_features(grp[date_col])
     X_imp  = pd.concat([base_f, _add_lag_features(y_imp, n_lags)], axis=1)
     X_clk  = pd.concat([base_f, _add_lag_features(y_clk, n_lags)], axis=1)
+    # nthread=1 → single-threaded → identical results on any CPU count
+    # (multi-threaded XGBoost uses different float-op ordering per machine)
     xgb_p  = dict(n_estimators=300, max_depth=3, learning_rate=0.04,
-                  subsample=0.8, colsample_bytree=0.8,
-                  min_child_weight=2, gamma=0.1, random_state=42, verbosity=0)
+                  subsample=1.0, colsample_bytree=1.0,
+                  min_child_weight=2, gamma=0.1,
+                  random_state=42, nthread=1, verbosity=0)
     try:
         m_imp = XGBRegressor(**xgb_p); m_clk = XGBRegressor(**xgb_p)
         m_imp.fit(X_imp, y_imp, verbose=False)
@@ -516,6 +546,10 @@ def forecast_xgb(n_df_json: str, product: str, periods: int, platform: str):
         last_clk = list(y_clk.values[-n_lags:]) if n_lags > 0 else []
         mean_imp = float(y_imp.mean()); mean_clk = float(y_clk.mean())
         rows_imp, rows_clk = [], []
+        # Fix: set ONE global seed before the loop.
+        # np.random.seed(i) inside the loop resets state each iteration,
+        # which behaves differently depending on numpy version.
+        rng = np.random.RandomState(42)
         for i, fd in enumerate(future_dates):
             bf = pd.DataFrame([{"day_of_week": fd.dayofweek, "day_of_month": fd.day,
                                  "week_of_year": int(fd.isocalendar().week), "month": fd.month,
@@ -525,9 +559,9 @@ def forecast_xgb(n_df_json: str, product: str, periods: int, platform: str):
             lag_c = {f"lag_{l+1}": (last_clk[-(l+1)] if l < len(last_clk) else mean_clk) for l in range(n_lags)}
             pred_i = float(m_imp.predict(pd.concat([bf, pd.DataFrame([lag_i])], axis=1))[0])
             pred_c = float(m_clk.predict(pd.concat([bf, pd.DataFrame([lag_c])], axis=1))[0])
-            np.random.seed(i)
-            boot_i = pred_i + np.random.choice(res_imp, 500, replace=True)
-            boot_c = pred_c + np.random.choice(res_clk, 500, replace=True)
+            # Use seeded rng — identical results on every machine
+            boot_i = pred_i + rng.choice(res_imp, 500, replace=True)
+            boot_c = pred_c + rng.choice(res_clk, 500, replace=True)
             rows_imp.append({"Date": fd.date(),
                              f"{platform}_Impressions":      max(0, round(pred_i)),
                              f"{platform}_Impressions_Low":  max(0, int(np.percentile(boot_i, 10))),
@@ -757,7 +791,7 @@ def render_forecast_ui(model_label, forecast_fn, model_key,
             if col_idx < 4:
                 if val is None:
                     acc_cols[col_idx].metric(f"{plat} {metric} Accuracy","N/A",
-                                             delta="Not enough data",delta_color="off")
+                                             delta="Sparse/zero data — unreliable",delta_color="off")
                 else:
                     fit = "Good fit ✅" if val>=80 else ("Fair fit ⚠️" if val>=60 else "Low fit ❌")
                     acc_cols[col_idx].metric(f"{plat} {metric} Accuracy", f"{val}%",
@@ -1092,12 +1126,12 @@ with tab_forecast:
     col_xgb_stat, col_prp_stat = st.columns(2)
     with col_xgb_stat:
         if XGB_OK:
-            st.success("✅ XGBoost — ready  (works with 5+ days of data, fast)")
+            st.success("✅ XGBoost — ready  (works with 7+ days of data, fast)")
         else:
             st.error(f"❌ XGBoost — {XGB_ERROR}")
     with col_prp_stat:
         if PROPHET_OK:
-            st.success("✅ Prophet — ready  (needs 7+ days, slower but captures seasonality)")
+            st.success("✅ Prophet — ready  (needs 10+ days, slower but captures seasonality)")
         else:
             st.warning(f"⚠️ Prophet — {PROPHET_ERROR}")
 
@@ -1106,11 +1140,8 @@ with tab_forecast:
         st.markdown("""
 | Feature | XGBoost ⚡ | Prophet 📈 |
 |---|---|---|
-| **Minimum data** | 5 days | 7 days |
+| **Minimum data** | 7 days | 10 days |
 | **Best at** | Short campaigns, quick patterns | Long campaigns with weekly seasonality |
-| **Confidence bands** | Bootstrap residuals | Bayesian uncertainty |
-| **Speed** | Very fast (< 5 sec) | Slower (10–30 sec) |
-| **Install** | `pip install xgboost` — no compiler | Needs C++ compiler or conda |
 | **Accuracy (small data)** | Better | Can overfit or be unstable |
 | **Accuracy (28+ days)** | Good | Excellent — picks up weekly patterns |
 | **Fake 100% accuracy?** | No — uses held-out validation | No — uses held-out validation |

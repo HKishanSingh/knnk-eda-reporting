@@ -39,7 +39,7 @@ EMPTY_DQ = {"n_days": 0, "is_sufficient": False, "warnings": [], "quality": "blo
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="KNNK SmartReport Engine Reporting App",
+    page_title="KNNK SmartReport Engine App",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -61,7 +61,7 @@ div[data-testid="stDataFrame"] { width: 100% !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 KNNK SmartReport Engine Reporting App")
+st.title("📊 KNNK SmartReport Engine App")
 st.caption("GAM + DCM Reconciliation · Campaign Mapping · Insights · Prophet & XGBoost Forecast · Trend Analysis")
 st.divider()
 
@@ -418,6 +418,54 @@ def _mape_accuracy(y_true, y_pred):
     return round(max(0.0, 100.0 - mape), 1)
 
 # ============================================================
+# NAIVE BASELINE  — "predict tomorrow = last known value"
+# This is the simplest possible forecast. If XGBoost/Prophet
+# can't beat this, the model is adding no value.
+#
+# WHY THIS MATTERS FOR MANAGEMENT:
+# - If XGBoost accuracy > Naive accuracy → model is genuinely useful
+# - If XGBoost accuracy ≈ Naive accuracy → data is too flat/short
+# - If XGBoost accuracy < Naive accuracy → something is wrong
+# ============================================================
+def _naive_holdout_accuracy(grp, date_col, value_col, periods):
+    """
+    Naive forecast: predict every future day = last known value.
+    Returns (accuracy_pct | None, n_holdout_days, naive_preds).
+    """
+    try:
+        df = (grp[[date_col, value_col]].copy()
+              .assign(**{date_col: lambda x: pd.to_datetime(x[date_col], errors="coerce")})
+              .groupby(date_col)[value_col].sum()
+              .reset_index().sort_values(date_col).reset_index(drop=True))
+        n  = len(df)
+        nh = min(periods, max(1, int(n * 0.20)), 7)
+        nt = n - nh
+        if nt < 2:
+            return None, 0, np.array([])
+        last_val    = float(df[value_col].iloc[nt - 1])
+        naive_preds = np.full(nh, last_val)
+        y_test      = df[value_col].iloc[nt:].values
+        acc         = _mape_accuracy(y_test, naive_preds)
+        return acc, nh, naive_preds
+    except Exception:
+        return None, 0, np.array([])
+
+def _verdict(model_acc, naive_acc):
+    """
+    Compare model vs naive baseline. Returns (verdict_text, colour).
+    colour: "green" | "orange" | "red"
+    """
+    if model_acc is None or naive_acc is None:
+        return "Cannot compare — insufficient data", "orange"
+    gap = model_acc - naive_acc
+    if gap >= 5:
+        return f"✅ Model beats naive by {round(gap,1)}pp — adding real value", "green"
+    elif gap >= 0:
+        return f"⚠️ Model marginally better than naive (+{round(gap,1)}pp) — use with caution", "orange"
+    else:
+        return f"❌ Model worse than naive by {round(abs(gap),1)}pp — data too short/flat to forecast reliably", "red"
+
+# ============================================================
 # XGBoost FEATURE ENGINEERING
 # ============================================================
 def _build_features(dates: pd.Series) -> pd.DataFrame:
@@ -442,6 +490,7 @@ def _add_lag_features(series: pd.Series, n: int) -> pd.DataFrame:
 # XGBoost HELD-OUT ACCURACY
 # ============================================================
 def _xgb_holdout_accuracy(grp, date_col, value_col, periods):
+    """Returns (model_acc, naive_acc, n_holdout)."""
     try:
         df = (grp[[date_col, value_col]].copy()
               .assign(**{date_col: lambda x: pd.to_datetime(x[date_col], errors="coerce")})
@@ -451,7 +500,7 @@ def _xgb_holdout_accuracy(grp, date_col, value_col, periods):
         nh = min(periods, max(1, int(n * 0.20)), 7)
         nt = n - nh
         if nt < XGB_MIN_HARD:
-            return None, 0
+            return None, None, 0
         nl = min(3, nt - 1)
         y  = df[value_col]
         X  = pd.concat([_build_features(df[date_col]), _add_lag_features(y, nl)], axis=1)
@@ -459,11 +508,14 @@ def _xgb_holdout_accuracy(grp, date_col, value_col, periods):
                           subsample=1.0, colsample_bytree=1.0,
                           random_state=42, nthread=1, verbosity=0)
         m.fit(X.iloc[:nt], y.iloc[:nt], verbose=False)
-        preds = m.predict(X.iloc[nt:])
-        acc   = _mape_accuracy(y.iloc[nt:].values, preds)
-        return acc, nh
+        preds     = m.predict(X.iloc[nt:])
+        model_acc = _mape_accuracy(y.iloc[nt:].values, preds)
+        # Naive: predict = last training value
+        naive_pred = np.full(nh, float(y.iloc[nt - 1]))
+        naive_acc  = _mape_accuracy(y.iloc[nt:].values, naive_pred)
+        return model_acc, naive_acc, nh
     except Exception:
-        return None, 0
+        return None, None, 0
 
 # ============================================================
 # XGBoost FORECAST ENGINE
@@ -500,10 +552,11 @@ def forecast_xgb(n_df_json: str, product: str, periods: int, platform: str):
     dq = _make_dq(n_days, platform, model="xgb")
     if not dq["is_sufficient"]:
         return None, None, dq
-    imp_acc, imp_ho = _xgb_holdout_accuracy(grp, date_col, imp_col, periods)
-    clk_acc, clk_ho = _xgb_holdout_accuracy(grp, date_col, clk_col, periods)
+    imp_acc, imp_naive, imp_ho = _xgb_holdout_accuracy(grp, date_col, imp_col, periods)
+    clk_acc, clk_naive, clk_ho = _xgb_holdout_accuracy(grp, date_col, clk_col, periods)
     accuracy = {"Impressions": imp_acc, "Clicks": clk_acc,
-                "imp_holdout_days": imp_ho, "clk_holdout_days": clk_ho}
+                "imp_holdout_days": imp_ho, "clk_holdout_days": clk_ho,
+                "imp_naive": imp_naive, "clk_naive": clk_naive}
     n_lags = min(3, n_days - 1)
     y_imp  = grp[imp_col].copy()
     y_clk  = grp[clk_col].copy()
@@ -563,6 +616,7 @@ def forecast_xgb(n_df_json: str, product: str, periods: int, platform: str):
 # Prophet HELD-OUT ACCURACY
 # ============================================================
 def _prophet_holdout_accuracy(grp, date_col, value_col, periods):
+    """Returns (model_acc, naive_acc, n_holdout)."""
     try:
         df = (grp[[date_col, value_col]].copy()
               .assign(**{date_col: lambda x: pd.to_datetime(x[date_col], errors="coerce")})
@@ -573,7 +627,7 @@ def _prophet_holdout_accuracy(grp, date_col, value_col, periods):
         nh = min(periods, max(1, int(n * 0.20)), 7)
         nt = n - nh
         if nt < PROPHET_MIN_HARD:
-            return None, 0
+            return None, None, 0
         train = df.iloc[:nt].copy()
         test  = df.iloc[nt:].copy()
         use_weekly = nt >= 14
@@ -584,10 +638,12 @@ def _prophet_holdout_accuracy(grp, date_col, value_col, periods):
         pred  = m.predict(m.make_future_dataframe(periods=nh))
         pred  = pred[pred["ds"].isin(test["ds"])][["ds","yhat"]]
         merged = test.merge(pred, on="ds", how="inner")
-        acc = _mape_accuracy(merged["y"].values, merged["yhat"].values)
-        return acc, nh
+        model_acc  = _mape_accuracy(merged["y"].values, merged["yhat"].values)
+        naive_pred = np.full(nh, float(train["y"].iloc[-1]))
+        naive_acc  = _mape_accuracy(test["y"].values, naive_pred)
+        return model_acc, naive_acc, nh
     except Exception:
-        return None, 0
+        return None, None, 0
 
 # ============================================================
 # Prophet FORECAST ENGINE
@@ -624,10 +680,11 @@ def forecast_prophet(n_df_json: str, product: str, periods: int, platform: str):
     dq = _make_dq(n_days, platform, model="prophet")
     if not dq["is_sufficient"]:
         return None, None, dq
-    imp_acc, imp_ho = _prophet_holdout_accuracy(grp, date_col, imp_col, periods)
-    clk_acc, clk_ho = _prophet_holdout_accuracy(grp, date_col, clk_col, periods)
+    imp_acc, imp_naive, imp_ho = _prophet_holdout_accuracy(grp, date_col, imp_col, periods)
+    clk_acc, clk_naive, clk_ho = _prophet_holdout_accuracy(grp, date_col, clk_col, periods)
     accuracy = {"Impressions": imp_acc, "Clicks": clk_acc,
-                "imp_holdout_days": imp_ho, "clk_holdout_days": clk_ho}
+                "imp_holdout_days": imp_ho, "clk_holdout_days": clk_ho,
+                "imp_naive": imp_naive, "clk_naive": clk_naive}
     imp_df = grp[[date_col, imp_col]].rename(columns={date_col:"ds", imp_col:"y"})
     clk_df = grp[[date_col, clk_col]].rename(columns={date_col:"ds", clk_col:"y"})
     use_weekly = n_days >= 14
@@ -760,28 +817,208 @@ def render_forecast_ui(model_label, forecast_fn, model_key,
 
     st.success(f"✅ {model_label} forecast — {forecast_days} day horizon for **{sel_product}**")
 
-    # Accuracy cards
-    st.markdown('<div class="section-title">🎯 Model Accuracy (Held-Out Validation)</div>',
+    # ── Accuracy cards + model vs naive comparison
+    st.markdown('<div class="section-title">🎯 Model Accuracy vs Naive Baseline (Held-Out Validation)</div>',
                 unsafe_allow_html=True)
-    st.caption("Last ~20% of actual dates were hidden during training, predicted, then compared to reality.")
+    st.caption(
+        "**How to read:** Last ~20% of actual dates hidden from training, predicted, then compared to reality. "
+        "Naive baseline = 'predict tomorrow = today's value' — the simplest possible forecast. "
+        "If the model can't beat naive, the data is too short or flat to forecast reliably."
+    )
+
+    # Build comparison rows for table
+    comparison_rows = []
     acc_cols = st.columns(4); col_idx = 0
     for plat, acc in [("GAM",gam_acc),("DCM",dcm_acc)]:
         if not acc: continue
-        for metric, ho_key in [("Impressions","imp_holdout_days"),("Clicks","clk_holdout_days")]:
-            val  = acc.get(metric)
-            ho_n = acc.get(ho_key, 0)
+        for metric, ho_key, naive_key in [
+            ("Impressions","imp_holdout_days","imp_naive"),
+            ("Clicks","clk_holdout_days","clk_naive")
+        ]:
+            val       = acc.get(metric)
+            naive_val = acc.get(naive_key)
+            ho_n      = acc.get(ho_key, 0)
             if col_idx < 4:
                 if val is None:
                     acc_cols[col_idx].metric(f"{plat} {metric} Accuracy","N/A",
-                                             delta="Sparse/zero data — unreliable",delta_color="off")
+                                             delta="Sparse/zero data",delta_color="off")
                 else:
-                    fit = "Good fit ✅" if val>=80 else ("Fair fit ⚠️" if val>=60 else "Low fit ❌")
-                    acc_cols[col_idx].metric(f"{plat} {metric} Accuracy", f"{val}%",
-                                            delta=f"{fit} ({ho_n}d hold-out)",
-                                            delta_color="normal" if val>=80 else "off")
+                    fit = "Good ✅" if val>=80 else ("Fair ⚠️" if val>=60 else "Low ❌")
+                    acc_cols[col_idx].metric(
+                        f"{plat} {metric} Accuracy", f"{val}%",
+                        delta=f"{fit} · Naive: {naive_val}% · {ho_n}d hold-out" if naive_val else f"{fit} · {ho_n}d hold-out",
+                        delta_color="normal" if val>=80 else "off")
                 col_idx += 1
+            # Collect for comparison table
+            verdict_text, colour = _verdict(val, naive_val)
+            comparison_rows.append({
+                "Platform":          plat,
+                "Metric":            metric,
+                "Model Accuracy":    f"{val}%" if val is not None else "N/A",
+                "Naive Accuracy":    f"{naive_val}%" if naive_val is not None else "N/A",
+                "Holdout Days":      ho_n,
+                "Verdict":           verdict_text,
+            })
+
     if col_idx == 0:
         st.info("Accuracy not available — data may be too sparse.")
+
+    # ── Model vs Naive comparison table
+    if comparison_rows:
+        st.markdown('<div class="section-title">📊 Model vs Naive Baseline — Full Comparison</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "This table answers: **Is the model actually adding value over a simple guess?** "
+            "A model that beats naive is genuinely learning your campaign patterns. "
+            "One that doesn't means more data is needed before forecasts are trustworthy."
+        )
+
+        cmp_df = pd.DataFrame(comparison_rows)
+        st.dataframe(cmp_df, use_container_width=True, hide_index=True)
+
+        # Overall verdict — use impressions as primary metric
+        imp_rows = [r for r in comparison_rows if r["Metric"] == "Impressions"]
+        verdicts = [_verdict(
+            float(r["Model Accuracy"].replace("%","")) if r["Model Accuracy"] != "N/A" else None,
+            float(r["Naive Accuracy"].replace("%","")) if r["Naive Accuracy"] != "N/A" else None
+        ) for r in imp_rows]
+
+        if verdicts:
+            st.markdown("**Overall Impression Forecast Trustworthiness:**")
+            for r, (vt, vc) in zip(imp_rows, verdicts):
+                if   vc == "green":  st.success(f"{r['Platform']}: {vt}")
+                elif vc == "orange": st.warning(f"{r['Platform']}: {vt}")
+                else:                st.error(f"{r['Platform']}: {vt}")
+
+        with st.expander("📖 How to explain and understand the results"):
+            st.markdown("""
+### What is a Naive Baseline?
+The simplest possible forecast: "whatever happened today will happen tomorrow."
+No model, no learning, just repeat the last known value.
+
+### Why do we compare against it?
+If our model (XGBoost or Prophet) can't predict better than this simple rule,
+it means our historical data doesn't have enough pattern for machine learning to learn from.
+This is an honest quality check — not a failure of the tool, but a signal about the data.
+
+### How to read the verdict
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| ✅ Model beats naive | The model is learning real patterns (e.g. weekday spikes) | Use forecast with confidence |
+| ⚠️ Marginal improvement | Some pattern detected but weak | Use as directional guide only |
+| ❌ Model worse than naive | Data too short, too flat, or too noisy | Collect more data before forecasting |
+
+### What if Clicks show N/A?
+Click volumes are often very low (0–5 per day). A series that's mostly zeros
+can't be reliably forecast by any model. This is a data characteristic, not a bug.
+Focus on Impressions accuracy for campaign planning.
+
+### The key number for management
+If you see "Model beats naive by 10pp+" on Impressions → the forecast is
+genuinely informed by your campaign's historical delivery patterns and is
+worth presenting to clients.
+""")
+
+    # ── Auto confidence label based on data size + model vs naive
+    def _confidence_label(n_days, model_acc, naive_acc, forecast_days):
+        """
+        Compute an overall confidence label for the forecast.
+        Returns (label, level) where level is "high"|"medium"|"low"|"caution"
+        """
+        # Data size check
+        if n_days is None or n_days < 10:
+            return ("🔴 Low Confidence — Less than 10 days of data. "
+                    "Forecast is extrapolation only, not pattern-based.", "low")
+        if n_days < 21:
+            size_level = "medium"
+            size_note  = f"only {n_days} days of history"
+        else:
+            size_level = "high"
+            size_note  = f"{n_days} days of history"
+
+        # Horizon check — accuracy degrades with longer forecasts
+        if forecast_days > 14:
+            horizon_note = f"{forecast_days}-day horizon (reliability decreases beyond 14 days)"
+        else:
+            horizon_note = f"{forecast_days}-day horizon (reliable range)"
+
+        # Model vs naive
+        if model_acc is None or naive_acc is None:
+            return (f"🟡 Medium Confidence — {size_note}, {horizon_note}. "
+                    f"Click accuracy unavailable (sparse data).", "medium")
+
+        gap = model_acc - naive_acc
+        if gap >= 5 and size_level == "high" and forecast_days <= 14:
+            return (f"🟢 High Confidence — Model beats naive by {round(gap,1)}pp on impressions. "
+                    f"{size_note}, {horizon_note}. Results are suitable for client reporting.", "high")
+        elif gap >= 5:
+            return (f"🟡 Medium-High Confidence — Model beats naive by {round(gap,1)}pp. "
+                    f"{size_note}, {horizon_note}. Use as directional guide.", "medium")
+        elif gap >= 0:
+            return (f"🟡 Medium Confidence — Marginal improvement over naive ({round(gap,1)}pp). "
+                    f"{size_note}, {horizon_note}. Use for planning only, not commitments.", "medium")
+        else:
+            return (f"🔴 Low Confidence — Model does not beat naive baseline. "
+                    f"{size_note}, {horizon_note}. More data needed before trusting this forecast.", "low")
+
+    # Compute confidence for GAM (primary) and DCM
+    st.markdown('<div class="section-title">🏷️ Forecast Confidence Level</div>', unsafe_allow_html=True)
+    st.caption("Auto-computed from: data size + model accuracy + horizon length + model vs naive comparison.")
+
+    conf_c1, conf_c2 = st.columns(2)
+    for plat, acc, dq_info, col in [
+        ("GAM", gam_acc, gam_dq, conf_c1),
+        ("DCM", dcm_acc, dcm_dq, conf_c2)
+    ]:
+        if not acc:
+            with col:
+                st.info(f"**{plat}:** No data processed — confidence N/A")
+            continue
+        n_d  = dq_info.get("n_days", 0)
+        m_a  = acc.get("Impressions")
+        n_a  = acc.get("imp_naive")
+        label, level = _confidence_label(n_d, m_a, n_a, forecast_days)
+        with col:
+            st.markdown(f"**{plat} Impressions Forecast**")
+            if   level == "high":    st.success(label)
+            elif level == "medium":  st.warning(label)
+            else:                    st.error(label)
+
+    # ── Honest limitations box
+    with st.expander("⚠️ Known limitations of this forecast — read before sharing with clients"):
+        st.markdown(f"""
+### What this forecast can and cannot do
+
+**✅ What it does well:**
+- Learns weekday delivery patterns (e.g. Monday spikes, weekend dips)
+- Captures campaign ramp-up / wind-down trends
+- Gives honest accuracy via held-out validation (not fake 100%)
+- Compares against naive baseline to prove it adds value
+- Provides confidence intervals (Low / High bands)
+
+**⚠️ Known limitations:**
+
+| Factor | Impact on accuracy |
+|---|---|
+| Campaign data < 21 days | High — model has little pattern to learn from |
+| Forecast horizon > 14 days | Medium — errors compound day-over-day |
+| Clicks data (sparse/near-zero) | High — click forecasts are unreliable by nature |
+| Budget pacing / flight end dates | Medium — model doesn't know if budget runs out |
+| External events (holidays, news) | Medium — not captured unless in historical data |
+| Current forecast horizon | **{forecast_days} days** {"✅ within reliable range" if forecast_days <= 14 else "⚠️ beyond recommended 14 days"} |
+
+**📋 Recommended use:**
+- **7–14 day forecasts with 21+ days of data** → suitable for client reporting with confidence label shown
+- **< 14 days of data** → internal planning only, not client-facing
+- **Click forecasts** → always treat as directional, never as precise commitments
+- **Impressions forecasts beating naive by 5pp+** → reliable enough for delivery estimates
+
+**💬 What to tell management / clients:**
+> *"Our forecast uses XGBoost/Prophet trained on {dq_info.get('n_days', 'X') if 'gam_dq' not in dir() else gam_dq.get('n_days','X')} days of actual campaign delivery data.
+> The model accuracy is measured by hiding real data from the model and testing its predictions — not by comparing against training data.
+> Impressions forecasts are reliable for planning. Click forecasts are directional only due to low daily volumes."*
+""")
 
     # Summary metrics
     future_only = final.tail(forecast_days)

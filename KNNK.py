@@ -1429,7 +1429,7 @@ with tab_reconcile:
                 (final_df[d_imp] - final_df[g_imp]) /
                 final_df[g_imp].replace(0,1) * 100).round(1)
             final_df["Flag"] = final_df["Discrepancy (%)"].apply(
-                lambda x: "⚠️ High" if abs(x) > 2 and abs(x) < 0 else "✅ OK")
+                lambda x: "⚠️ High" if abs(x) < 2 and abs(x) < 0 else "✅ OK")
             m1,m2,m3,m4 = st.columns(4)
             m1.metric("GAM Impressions", f"{int(final_df[g_imp].sum()):,}")
             m2.metric("DCM Impressions", f"{int(final_df[d_imp].sum()):,}")

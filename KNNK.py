@@ -1427,7 +1427,7 @@ with tab_reconcile:
         if g_imp in final_df.columns and d_imp in final_df.columns:
             final_df["Discrepancy (%)"] = (
                 (final_df[d_imp] - final_df[g_imp]) /
-                final_df[g_imp].replace(0,1) * 100).round(1)
+                final_df[g_imp].replace(0,1) * 100)
             final_df["Flag"] = final_df["Discrepancy (%)"].apply(
                 lambda x: "⚠️ High" if x > 2 or x < 0 else "✅ OK")
             m1,m2,m3,m4 = st.columns(4)
